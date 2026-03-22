@@ -1,0 +1,6 @@
+.env
+projects_data.json
+__pycache__/
+.venv/
+bot.log
+bot.pid
