@@ -39,6 +39,26 @@ python3 -m venv .venv
 
    **注意**：不要把真实 Token 提交到 Git；`.env` 已在 `.gitignore` 中。
 
+### 3. 可选：管理员（`config.json`）
+
+复制示例并编辑，写入可**编辑 / 删除任意项目**的 Telegram 用户数字 ID（可多选）：
+
+```bash
+cp config.example.json config.json
+```
+
+示例 `config.json`：
+
+```json
+{
+  "admin_ids": [123456789, 987654321]
+}
+```
+
+`config.json` 已加入 `.gitignore`，请勿把含真实 ID 的文件提交到公开仓库。修改后**无需重启**即可在下次命令时生效（每次读取文件）。
+
+在**私聊**里向机器人发送 **`/id`** 可查看自己的数字用户 ID（该命令**未**写在 `/help` 里）。
+
 ## 启动方式
 
 ### 推荐：使用启动脚本（后台，脚本立即退出）

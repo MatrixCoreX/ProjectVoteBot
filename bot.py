@@ -16,6 +16,8 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
+import tenders as tenders_store
+
 from i18n import (
     DEFAULT_LOCALE,
     LOCALES,
@@ -28,7 +30,11 @@ from i18n import (
 
 DATA_FILE = Path(__file__).resolve().parent / "projects_data.json"
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
+CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 _lock = threading.Lock()
+
+# 群内机器人消息在发送后多久删除（秒）；需管理员「删除消息」权限
+GROUP_MESSAGE_TTL_SEC = 300
 
 
 def _load_env_file() -> None:
@@ -101,6 +107,33 @@ def _is_publisher(p: dict, user_id: int) -> bool:
     return aid is not None and aid == user_id
 
 
+def _load_admin_ids() -> frozenset[int]:
+    """从 config.json 读取管理员 Telegram 数字 ID；文件缺失或格式错误则视为无管理员。"""
+    if not CONFIG_FILE.is_file():
+        return frozenset()
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    ids = raw.get("admin_ids")
+    if not isinstance(ids, list):
+        return frozenset()
+    out: set[int] = set()
+    for x in ids:
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    return frozenset(out)
+
+
+def _can_moderate_project(
+    p: dict, user_id: int, admin_ids: frozenset[int]
+) -> bool:
+    """发布者或 config 中的管理员可编辑/删除该项目。"""
+    return _is_publisher(p, user_id) or user_id in admin_ids
+
+
 def _save_data(data: dict) -> None:
     _sync_next_id(data)
     DATA_FILE.write_text(
@@ -114,9 +147,28 @@ def _normalize_project(p: dict) -> dict:
     p.setdefault("up", [])
     p.setdefault("down", [])
     p.setdefault("author_username", None)
+    p.setdefault("budget", "")
     p["up"] = [int(x) for x in p["up"]]
     p["down"] = [int(x) for x in p["down"]]
     return p
+
+
+def _parse_desc_and_budget(body: str) -> tuple[str, str]:
+    """第一段为描述；第一个 | 后为预算（可空）。无 | 则预算为空字符串。"""
+    body = body.strip()
+    if "|" not in body:
+        return body, ""
+    desc, _, rest = body.partition("|")
+    return desc.strip(), rest.strip()
+
+
+def _parse_edit_payload(s: str) -> tuple[str, str | None]:
+    """有 | 时：(描述, 预算或空)；无 | 时：(整段描述, None 表示不改预算)。"""
+    s = s.strip()
+    if "|" not in s:
+        return s, None
+    desc, _, rest = s.partition("|")
+    return desc.strip(), rest.strip()
 
 
 def _user_lang(data: dict, user_id: int) -> str:
@@ -145,6 +197,14 @@ def _get_projects(data: dict) -> list[dict]:
 _MAX_VOTE_PANEL_MSG = 4096
 
 
+def _budget_line_html(p: dict, locale: str) -> str:
+    b = (p.get("budget") or "").strip()
+    bud_l = t(locale, "budget_label")
+    if b:
+        return f"💰 <b>{bud_l}:</b> {escape(b)}\n"
+    return f"💰 <b>{bud_l}:</b> {t(locale, 'budget_not_set')}\n"
+
+
 def _project_block_html(p: dict, locale: str) -> str:
     pid = int(p["id"])
     text = (p.get("text") or "").strip() or t(locale, "no_description")
@@ -159,6 +219,7 @@ def _project_block_html(p: dict, locale: str) -> str:
     dn_l = t(locale, "downvotes")
     return (
         f"<b>#{pid}</b>\n{safe_body}\n"
+        f"{_budget_line_html(p, locale)}"
         f"👤 <b>{pub_l}:</b> {pub}\n"
         f"{up_l}: <b>{up_n}</b> · {dn_l}: <b>{down_n}</b>\n"
         f"— — —\n"
@@ -311,6 +372,7 @@ def _format_single_project_vote_panel(
     body = (
         t(locale, "single_vote_title", pid=pid)
         + f"<b>#{pid}</b>\n{safe_body}\n"
+        f"{_budget_line_html(p, locale)}"
         f"👤 <b>{pub_l}:</b> {pub}\n"
         f"{up_l}: <b>{up_n}</b> · {dn_l}: <b>{down_n}</b>"
     )
@@ -366,6 +428,7 @@ def _apply_vote(
             data["projects"][i] = {
                 "id": p["id"],
                 "text": p.get("text", ""),
+                "budget": (p.get("budget") or "").strip(),
                 "author_id": p.get("author_id"),
                 "author_name": p.get("author_name", ""),
                 "author_username": p.get("author_username"),
@@ -374,6 +437,84 @@ def _apply_vote(
             }
             break
     return hint
+
+
+def _apply_bid_vote(
+    td: dict, bid_id: int, user_id: int, choice: str, locale: str
+) -> str:
+    """单条投标 👍/👎，规则与项目投票相同。"""
+    tenders_store._ensure_bid_votes_inplace(td)
+    b = tenders_store.bid_ref_by_id(td, bid_id)
+    if not b:
+        return t(locale, "callback_invalid")
+
+    ups = set(b["up"])
+    downs = set(b["down"])
+    if choice == "u":
+        if user_id in downs:
+            downs.discard(user_id)
+        if user_id in ups:
+            ups.discard(user_id)
+            hint = t(locale, "hint_up_off")
+        else:
+            ups.add(user_id)
+            hint = t(locale, "hint_up_on")
+    else:
+        if user_id in ups:
+            ups.discard(user_id)
+        if user_id in downs:
+            downs.discard(user_id)
+            hint = t(locale, "hint_down_off")
+        else:
+            downs.add(user_id)
+            hint = t(locale, "hint_down_on")
+
+    b["up"] = list(ups)
+    b["down"] = list(downs)
+    return hint
+
+
+def _parse_bid_vote_callback(data: str) -> tuple[int, int, str] | None:
+    """be:{part_idx}:{bid_id}:u|d → (part_idx, bid_id, choice)。"""
+    if not data.startswith("be:"):
+        return None
+    parts = data.split(":")
+    if len(parts) != 4:
+        return None
+    _, part_s, bid_s, c = parts
+    if c not in ("u", "d"):
+        return None
+    try:
+        return int(part_s), int(bid_s), c
+    except ValueError:
+        return None
+
+
+def _markup_bid_vote_rows(
+    td: dict, locale: str, bid_ids: list[int], part_idx: int
+) -> types.InlineKeyboardMarkup:
+    markup = types.InlineKeyboardMarkup()
+    for bid_id in bid_ids:
+        b = tenders_store.bid_ref_by_id(td, bid_id)
+        if not b:
+            continue
+        up_n = len(b.get("up") or [])
+        dn_n = len(b.get("down") or [])
+        markup.row(
+            types.InlineKeyboardButton(
+                f"#{bid_id}",
+                callback_data=f"bel:{bid_id}",
+            ),
+            types.InlineKeyboardButton(
+                t(locale, "btn_up", n=up_n),
+                callback_data=f"be:{part_idx}:{bid_id}:u",
+            ),
+            types.InlineKeyboardButton(
+                t(locale, "btn_down", n=dn_n),
+                callback_data=f"be:{part_idx}:{bid_id}:d",
+            ),
+        )
+    return markup
 
 
 def main() -> None:
@@ -386,9 +527,41 @@ def main() -> None:
 
     bot = telebot.TeleBot(token, parse_mode="HTML")
 
+    _group_msg_timers: dict[tuple[int, int], threading.Timer] = {}
+    _group_msg_timer_lock = threading.Lock()
+
+    def schedule_group_message_delete(
+        chat_id: int, message_id: int, chat_type: str | None
+    ) -> None:
+        """群组/超级群：在 GROUP_MESSAGE_TTL_SEC 后删除该条机器人消息；重复调用会重置计时。"""
+        if chat_type not in ("group", "supergroup"):
+            return
+        key = (chat_id, message_id)
+
+        def do_delete() -> None:
+            try:
+                bot.delete_message(chat_id, message_id)
+            except ApiTelegramException:
+                pass
+            finally:
+                with _group_msg_timer_lock:
+                    _group_msg_timers.pop(key, None)
+
+        with _group_msg_timer_lock:
+            old = _group_msg_timers.pop(key, None)
+            if old is not None:
+                old.cancel()
+            timer = threading.Timer(GROUP_MESSAGE_TTL_SEC, do_delete)
+            timer.daemon = True
+            _group_msg_timers[key] = timer
+            timer.start()
+
     def send_chat(message: types.Message, text: str, **kwargs) -> None:
         """发到当前聊天，不引用用户那条命令（非 reply）。"""
-        bot.send_message(message.chat.id, text, **kwargs)
+        sent = bot.send_message(message.chat.id, text, **kwargs)
+        schedule_group_message_delete(
+            sent.chat.id, sent.message_id, getattr(sent.chat, "type", None)
+        )
 
     def publisher_from_message(message: types.Message) -> tuple[int, str, str | None]:
         u = message.from_user
@@ -434,11 +607,34 @@ def main() -> None:
             t(loc, "lang_set", name=LOCALE_DISPLAY[loc]),
         )
 
+    @bot.message_handler(commands=["id"])
+    def cmd_id(message: types.Message):
+        """私聊返回当前用户 Telegram 数字 ID（不写入 /help）。"""
+        uid_op = message.from_user.id if message.from_user else 0
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid_op)
+        if getattr(message.chat, "type", None) != "private":
+            send_chat(message, t(lang, "id_private_only"))
+            return
+        u = message.from_user
+        if not u:
+            send_chat(
+                message,
+                t(lang, "id_reply", uid="—", uname=t(lang, "id_no_username")),
+            )
+            return
+        uname = (
+            f"@{escape(u.username)}" if u.username else t(lang, "id_no_username")
+        )
+        send_chat(message, t(lang, "id_reply", uid=u.id, uname=uname))
+
     @bot.message_handler(commands=["publish"])
     def cmd_publish(message: types.Message):
         uid, uname, uname_at = publisher_from_message(message)
         parts = (message.text or "").split(maxsplit=1)
-        desc = parts[1].strip() if len(parts) > 1 else ""
+        raw_body = parts[1].strip() if len(parts) > 1 else ""
+        desc, budget = _parse_desc_and_budget(raw_body)
         with _lock:
             data = _load_data()
             lang = _user_lang(data, uid)
@@ -455,6 +651,7 @@ def main() -> None:
                 {
                     "id": pid,
                     "text": desc,
+                    "budget": budget,
                     "author_id": uid,
                     "author_name": uname,
                     "author_username": uname_at,
@@ -529,7 +726,8 @@ def main() -> None:
                 err = t(lang, "delete_no_such", pid=pid)
             else:
                 p = _normalize_project(data["projects"][idx])
-                if not _is_publisher(p, uid):
+                admins = _load_admin_ids()
+                if not _can_moderate_project(p, uid, admins):
                     err = t(lang, "delete_not_pub")
                 else:
                     data["projects"].pop(idx)
@@ -558,8 +756,8 @@ def main() -> None:
             send_chat(message, t(lang, "edit_bad_id"))
             return
 
-        new_text = parts[2].strip()
-        if not new_text:
+        new_desc, new_budget = _parse_edit_payload(parts[2])
+        if not new_desc:
             send_chat(message, t(lang, "edit_empty"))
             return
 
@@ -572,16 +770,25 @@ def main() -> None:
                 err = t(lang, "edit_no_such", pid=pid)
             else:
                 p = _normalize_project(data["projects"][idx])
-                if not _is_publisher(p, uid):
+                admins = _load_admin_ids()
+                if not _can_moderate_project(p, uid, admins):
                     err = t(lang, "edit_not_pub")
                 else:
-                    p["text"] = new_text
+                    p["text"] = new_desc
+                    if new_budget is not None:
+                        p["budget"] = new_budget
+                    is_pub = _is_publisher(p, uid)
+                    aname = (
+                        pub_name if is_pub else (p.get("author_name") or "").strip()
+                    )
+                    au = pub_username if is_pub else p.get("author_username")
                     data["projects"][idx] = {
                         "id": p["id"],
                         "text": p["text"],
+                        "budget": (p.get("budget") or "").strip(),
                         "author_id": p.get("author_id"),
-                        "author_name": pub_name,
-                        "author_username": pub_username,
+                        "author_name": aname,
+                        "author_username": au,
                         "up": p["up"],
                         "down": p["down"],
                     }
@@ -592,6 +799,181 @@ def main() -> None:
             return
 
         send_chat(message, t(lang, "edit_ok", pid=pid))
+
+    @bot.message_handler(commands=["tender_add"])
+    def cmd_tender_add(message: types.Message):
+        uid, name, username = publisher_from_message(message)
+        admins = _load_admin_ids()
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+        if uid not in admins:
+            send_chat(message, t(lang, "tender_add_need_admin"))
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        body = parts[1].strip() if len(parts) > 1 else ""
+        if not body:
+            send_chat(message, t(lang, "tender_add_usage"))
+            return
+        with _lock:
+            td = tenders_store.load_tenders()
+            tid = int(td["next_tender_id"])
+            td["next_tender_id"] = tid + 1
+            td["tenders"].append(
+                {
+                    "id": tid,
+                    "text": body,
+                    "status": "open",
+                    "author_id": uid,
+                    "author_name": name,
+                    "author_username": username,
+                }
+            )
+            tenders_store.save_tenders(td)
+        send_chat(message, t(lang, "tender_add_ok", tid=tid))
+
+    @bot.message_handler(commands=["tenders"])
+    def cmd_tenders(message: types.Message):
+        uid = message.from_user.id if message.from_user else 0
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+            td = tenders_store.load_tenders()
+        for chunk in tenders_store.format_tender_list_batches(td, lang):
+            send_chat(message, chunk)
+
+    @bot.message_handler(commands=["tender_view"])
+    def cmd_tender_view(message: types.Message):
+        uid = message.from_user.id if message.from_user else 0
+        parts = (message.text or "").split()
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+        if len(parts) < 2:
+            send_chat(message, t(lang, "tender_view_bad_id"))
+            return
+        try:
+            tid = int(parts[1])
+        except ValueError:
+            send_chat(message, t(lang, "tender_view_bad_id"))
+            return
+        with _lock:
+            td = tenders_store.load_tenders()
+        batches = tenders_store.format_tender_detail_batches(td, tid, lang)
+        if not batches:
+            send_chat(message, t(lang, "tender_view_not_found", tid=tid))
+            return
+        for chunk, bid_ids, part_idx in batches:
+            mk = (
+                _markup_bid_vote_rows(td, lang, bid_ids, part_idx)
+                if bid_ids
+                else None
+            )
+            send_chat(message, chunk, reply_markup=mk)
+
+    @bot.message_handler(commands=["tender_bid"])
+    def cmd_tender_bid(message: types.Message):
+        uid, name, username = publisher_from_message(message)
+        raw = message.text or ""
+        parts = raw.split(maxsplit=2)
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+        if len(parts) < 3:
+            send_chat(message, t(lang, "tender_bid_usage"))
+            return
+        try:
+            tid = int(parts[1])
+        except ValueError:
+            send_chat(message, t(lang, "tender_bid_bad_id"))
+            return
+        rest = parts[2].strip()
+        if "|" not in rest:
+            send_chat(message, t(lang, "tender_bid_need_pipe"))
+            return
+        team, _, quote = rest.partition("|")
+        team, quote = team.strip(), quote.strip()
+        if not team:
+            send_chat(message, t(lang, "tender_bid_empty_team"))
+            return
+        if not quote:
+            send_chat(message, t(lang, "tender_bid_empty_quote"))
+            return
+        err: str | None = None
+        bid_id: int | None = None
+        with _lock:
+            td = tenders_store.load_tenders()
+            ten = tenders_store.tender_by_id(td, tid)
+            if not ten:
+                err = t(lang, "tender_bid_tender_missing", tid=tid)
+            elif (ten.get("status") or "open").strip().lower() == "closed":
+                err = t(lang, "tender_bid_tender_closed", tid=tid)
+            else:
+                bid_id = int(td["next_bid_id"])
+                td["next_bid_id"] = bid_id + 1
+                td["bids"].append(
+                    {
+                        "id": bid_id,
+                        "tender_id": tid,
+                        "team_text": team,
+                        "quote": quote,
+                        "bidder_id": uid,
+                        "bidder_name": name,
+                        "bidder_username": username,
+                        "up": [],
+                        "down": [],
+                    }
+                )
+                tenders_store.save_tenders(td)
+        if err:
+            send_chat(message, err)
+            return
+        assert bid_id is not None
+        send_chat(message, t(lang, "tender_bid_ok", bid_id=bid_id, tid=tid))
+
+    @bot.message_handler(commands=["tender_close"])
+    def cmd_tender_close(message: types.Message):
+        uid, _, _ = publisher_from_message(message)
+        admins = _load_admin_ids()
+        parts = (message.text or "").split()
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+        if len(parts) < 2:
+            send_chat(message, t(lang, "tender_close_usage"))
+            return
+        try:
+            tid = int(parts[1])
+        except ValueError:
+            send_chat(message, t(lang, "tender_close_bad_id"))
+            return
+        if uid not in admins:
+            send_chat(message, t(lang, "tender_close_need_admin"))
+            return
+        err: str | None = None
+        with _lock:
+            td = tenders_store.load_tenders()
+            idx = None
+            for i, x in enumerate(td.get("tenders") or []):
+                try:
+                    if int(x["id"]) == tid:
+                        idx = i
+                        break
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if idx is None:
+                err = t(lang, "tender_close_not_found", tid=tid)
+            else:
+                cur = (td["tenders"][idx].get("status") or "open").strip().lower()
+                if cur == "closed":
+                    err = t(lang, "tender_close_already", tid=tid)
+                else:
+                    td["tenders"][idx]["status"] = "closed"
+                    tenders_store.save_tenders(td)
+        if err:
+            send_chat(message, err)
+            return
+        send_chat(message, t(lang, "tender_close_ok", tid=tid))
 
     def _cb_vote_parse(data: str) -> tuple[int, str, str] | None:
         """Returns (pid, choice, mode) where mode is 'single' or 'all', or None."""
@@ -649,7 +1031,83 @@ def main() -> None:
                 message_id=call.message.message_id,
                 reply_markup=markup,
             )
+            schedule_group_message_delete(
+                call.message.chat.id,
+                call.message.message_id,
+                getattr(call.message.chat, "type", None),
+            )
         except telebot.apihelper.ApiTelegramException:
+            pass
+
+        bot.answer_callback_query(call.id, hint, show_alert=False)
+
+    @bot.callback_query_handler(
+        func=lambda c: c.data and c.data.startswith("bel:")
+    )
+    def on_bid_label_click(call: types.CallbackQuery):
+        uid_cb = call.from_user.id if call.from_user else 0
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid_cb)
+        bot.answer_callback_query(
+            call.id, t(lang, "tender_bid_id_btn_hint"), show_alert=False
+        )
+
+    @bot.callback_query_handler(
+        func=lambda c: c.data and c.data.startswith("be:")
+    )
+    def on_bid_vote(call: types.CallbackQuery):
+        parsed = _parse_bid_vote_callback(call.data or "")
+        uid_cb = call.from_user.id if call.from_user else 0
+        if not parsed:
+            with _lock:
+                data = _load_data()
+                lang_cb = _user_lang(data, uid_cb)
+            bot.answer_callback_query(call.id, t(lang_cb, "callback_invalid"))
+            return
+
+        part_idx, bid_id, choice = parsed
+        uid = uid_cb
+        with _lock:
+            data = _load_data()
+            lang = _user_lang(data, uid)
+            td = tenders_store.load_tenders()
+            hint = _apply_bid_vote(td, bid_id, uid, choice, lang)
+            tenders_store.save_tenders(td)
+
+            b = tenders_store.bid_ref_by_id(td, bid_id)
+            if not b:
+                bot.answer_callback_query(call.id, t(lang, "callback_invalid"))
+                return
+            tid = int(b["tender_id"])
+            batches = tenders_store.format_tender_detail_batches(td, tid, lang)
+            if not batches:
+                bot.answer_callback_query(call.id, t(lang, "callback_invalid"))
+                return
+            if part_idx >= len(batches):
+                part_idx = len(batches) - 1
+            if part_idx < 0:
+                part_idx = 0
+            text, bid_ids, _ = batches[part_idx]
+            markup = (
+                _markup_bid_vote_rows(td, lang, bid_ids, part_idx)
+                if bid_ids
+                else types.InlineKeyboardMarkup()
+            )
+
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=markup,
+            )
+            schedule_group_message_delete(
+                call.message.chat.id,
+                call.message.message_id,
+                getattr(call.message.chat, "type", None),
+            )
+        except ApiTelegramException:
             pass
 
         bot.answer_callback_query(call.id, hint, show_alert=False)
